@@ -10,6 +10,7 @@ import static dev.langchain4j.spi.ServiceHelper.loadFactories;
 
 import dev.langchain4j.Internal;
 import dev.langchain4j.data.message.ChatMessage;
+import dev.langchain4j.data.message.ChatMessageType;
 import dev.langchain4j.data.message.SystemMessage;
 import dev.langchain4j.data.message.UserMessage;
 import dev.langchain4j.guardrail.GuardrailRequestParams;
@@ -75,10 +76,11 @@ class DefaultAiServices<T> extends AiServices<T> {
                     parameter.getAnnotation(dev.langchain4j.service.UserMessage.class);
             MemoryId memoryId = parameter.getAnnotation(MemoryId.class);
             UserName userName = parameter.getAnnotation(UserName.class);
-            if (v == null && userMessage == null && memoryId == null && userName == null) {
+            Messages messages = parameter.getAnnotation(Messages.class);
+            if (v == null && userMessage == null && memoryId == null && userName == null && messages == null) {
                 throw illegalConfiguration(
                         "Parameter '%s' of method '%s' should be annotated with @V or @UserMessage "
-                                + "or @UserName or @MemoryId",
+                                + "or @UserName or @MemoryId or @Messages",
                         parameter.getName(), method.getName());
             }
         }
@@ -153,25 +155,95 @@ class DefaultAiServices<T> extends AiServices<T> {
                                 ? context.chatMemoryService.getOrCreateChatMemory(memoryId)
                                 : null;
 
-                        Optional<SystemMessage> systemMessage = prepareSystemMessage(memoryId, method, args);
-                        var userMessageTemplate = getUserMessageTemplate(method, args);
-                        var variables = InternalReflectionVariableResolver.findTemplateVariables(
-                                userMessageTemplate, method, args);
-                        UserMessage userMessage = prepareUserMessage(method, args, userMessageTemplate, variables);
+                        // Check if @Messages annotation is present
+                        Optional<MessagesParameter> messagesParameter = findMessagesParameter(method.getParameters(), args);
+                        
+                        List<ChatMessage> messages;
+                        UserMessage userMessage;
                         AugmentationResult augmentationResult = null;
-                        if (context.retrievalAugmentor != null) {
-                            List<ChatMessage> chatMemoryMessages = chatMemory != null ? chatMemory.messages() : null;
-                            Metadata metadata = Metadata.from(userMessage, memoryId, chatMemoryMessages);
-                            AugmentationRequest augmentationRequest = new AugmentationRequest(userMessage, metadata);
-                            augmentationResult = context.retrievalAugmentor.augment(augmentationRequest);
-                            userMessage = (UserMessage) augmentationResult.chatMessage();
+                        
+                        if (messagesParameter.isPresent()) {
+                            // Handle @Messages annotation
+                            MessagesParameter mp = messagesParameter.get();
+                            List<ChatMessage> dynamicMessages = new ArrayList<>(mp.messages());
+                            
+                            // Validate messages if enabled
+                            validateMessages(dynamicMessages, mp.annotation());
+                            
+                            // Add system message if enabled and present
+                            if (mp.annotation().includeSystemMessage()) {
+                                Optional<SystemMessage> systemMessage = prepareSystemMessage(memoryId, method, args);
+                                systemMessage.ifPresent(sm -> {
+                                    // Insert system message at the beginning if not already present
+                                    if (dynamicMessages.isEmpty() || dynamicMessages.get(0).type() != ChatMessageType.SYSTEM) {
+                                        dynamicMessages.add(0, sm);
+                                    }
+                                });
+                            }
+                            
+                            // Use the first user message for augmentation and guardrails
+                            userMessage = dynamicMessages.stream()
+                                    .filter(msg -> msg.type() == ChatMessageType.USER)
+                                    .findFirst()
+                                    .map(msg -> (UserMessage) msg)
+                                    .orElseThrow(() -> illegalArgument("No user message found in @Messages parameter"));
+                            
+                            messages = dynamicMessages;
+                            
+                            // Handle augmentation if needed
+                            if (context.retrievalAugmentor != null) {
+                                List<ChatMessage> chatMemoryMessages = chatMemory != null ? chatMemory.messages() : null;
+                                Metadata metadata = Metadata.from(userMessage, memoryId, chatMemoryMessages);
+                                AugmentationRequest augmentationRequest = new AugmentationRequest(userMessage, metadata);
+                                augmentationResult = context.retrievalAugmentor.augment(augmentationRequest);
+                                // Replace the user message with augmented one
+                                for (int i = 0; i < messages.size(); i++) {
+                                    if (messages.get(i).type() == ChatMessageType.USER) {
+                                        messages.set(i, augmentationResult.chatMessage());
+                                        break;
+                                    }
+                                }
+                            }
+                            
+                            // Add to memory if enabled
+                            if (mp.annotation().addToMemory() && context.hasChatMemory()) {
+                                for (ChatMessage msg : dynamicMessages) {
+                                    chatMemory.add(msg);
+                                }
+                            }
+                        } else {
+                            // Original logic for @UserMessage and @SystemMessage
+                            Optional<SystemMessage> systemMessage = prepareSystemMessage(memoryId, method, args);
+                            var userMessageTemplate = getUserMessageTemplate(method, args);
+                            var variables = InternalReflectionVariableResolver.findTemplateVariables(
+                                    userMessageTemplate, method, args);
+                            userMessage = prepareUserMessage(method, args, userMessageTemplate, variables);
+                            
+                            if (context.retrievalAugmentor != null) {
+                                List<ChatMessage> chatMemoryMessages = chatMemory != null ? chatMemory.messages() : null;
+                                Metadata metadata = Metadata.from(userMessage, memoryId, chatMemoryMessages);
+                                AugmentationRequest augmentationRequest = new AugmentationRequest(userMessage, metadata);
+                                augmentationResult = context.retrievalAugmentor.augment(augmentationRequest);
+                                userMessage = (UserMessage) augmentationResult.chatMessage();
+                            }
+
+                            messages = new ArrayList<>();
+                            if (context.hasChatMemory()) {
+                                systemMessage.ifPresent(chatMemory::add);
+                                chatMemory.add(userMessage);
+                                messages.addAll(chatMemory.messages());
+                            } else {
+                                systemMessage.ifPresent(messages::add);
+                                messages.add(userMessage);
+                            }
                         }
 
                         var commonGuardrailParam = GuardrailRequestParams.builder()
                                 .chatMemory(chatMemory)
                                 .augmentationResult(augmentationResult)
-                                .userMessageTemplate(userMessageTemplate)
-                                .variables(variables)
+                                .userMessageTemplate(messagesParameter.isPresent() ? "" : getUserMessageTemplate(method, args))
+                                .variables(messagesParameter.isPresent() ? Map.of() : InternalReflectionVariableResolver.findTemplateVariables(
+                                        getUserMessageTemplate(method, args), method, args))
                                 .build();
 
                         // Invoke input guardrails
@@ -191,17 +263,6 @@ class DefaultAiServices<T> extends AiServices<T> {
                         }
                         if ((!supportsJsonSchema || jsonSchema.isEmpty()) && !streaming) {
                             userMessage = appendOutputFormatInstructions(returnType, userMessage);
-                        }
-
-                        List<ChatMessage> messages = new ArrayList<>();
-
-                        if (context.hasChatMemory()) {
-                            systemMessage.ifPresent(chatMemory::add);
-                            chatMemory.add(userMessage);
-                            messages.addAll(chatMemory.messages());
-                        } else {
-                            systemMessage.ifPresent(messages::add);
-                            messages.add(userMessage);
                         }
 
                         Future<Moderation> moderationFuture = triggerModerationIfNeeded(method, messages);
@@ -408,6 +469,13 @@ class DefaultAiServices<T> extends AiServices<T> {
 
     private static String getUserMessageTemplate(Method method, Object[] args) {
 
+        // Check if @Messages annotation is present
+        Optional<MessagesParameter> messagesParameter = findMessagesParameter(method.getParameters(), args);
+        if (messagesParameter.isPresent()) {
+            // Return empty string for @Messages as we don't use templates
+            return "";
+        }
+
         Optional<String> templateFromMethodAnnotation = findUserMessageTemplateFromMethodAnnotation(method);
         Optional<String> templateFromParameterAnnotation =
                 findUserMessageTemplateFromAnnotatedParameter(method.getParameters(), args);
@@ -513,5 +581,109 @@ class DefaultAiServices<T> extends AiServices<T> {
             }
         }
         return Optional.empty();
+    }
+
+    /**
+     * Finds and extracts messages from parameters annotated with @Messages.
+     * 
+     * @param parameters the method parameters
+     * @param args the method arguments
+     * @return Optional containing the messages list and annotation if found
+     */
+    private static Optional<MessagesParameter> findMessagesParameter(Parameter[] parameters, Object[] args) {
+        for (int i = 0; i < parameters.length; i++) {
+            Messages messagesAnnotation = parameters[i].getAnnotation(Messages.class);
+            if (messagesAnnotation != null) {
+                Object arg = args[i];
+                if (arg == null) {
+                    throw illegalArgument(
+                            "The value of parameter '%s' annotated with @Messages in method must not be null",
+                            parameters[i].getName());
+                }
+                
+                if (arg instanceof List<?>) {
+                    List<?> list = (List<?>) arg;
+                    if (list.isEmpty()) {
+                        throw illegalArgument(
+                                "The list of messages in parameter '%s' annotated with @Messages must not be empty",
+                                parameters[i].getName());
+                    }
+                    
+                    // Validate that all elements are ChatMessage instances
+                    for (Object item : list) {
+                        if (!(item instanceof ChatMessage)) {
+                            throw illegalArgument(
+                                    "All elements in the list for parameter '%s' annotated with @Messages must be ChatMessage instances",
+                                    parameters[i].getName());
+                        }
+                    }
+                    
+                    @SuppressWarnings("unchecked")
+                    List<ChatMessage> messages = (List<ChatMessage>) list;
+                    return Optional.of(new MessagesParameter(messages, messagesAnnotation));
+                } else if (arg instanceof ChatMessage[]) {
+                    ChatMessage[] array = (ChatMessage[]) arg;
+                    if (array.length == 0) {
+                        throw illegalArgument(
+                                "The array of messages in parameter '%s' annotated with @Messages must not be empty",
+                                parameters[i].getName());
+                    }
+                    return Optional.of(new MessagesParameter(List.of(array), messagesAnnotation));
+                } else {
+                    throw illegalArgument(
+                            "Parameter '%s' annotated with @Messages must be of type List<ChatMessage> or ChatMessage[]",
+                            parameters[i].getName());
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * Validates the order and structure of messages if validation is enabled.
+     * 
+     * @param messages the list of messages to validate
+     * @param annotation the @Messages annotation
+     */
+    private static void validateMessages(List<ChatMessage> messages, Messages annotation) {
+        if (!annotation.validateOrder()) {
+            return;
+        }
+        
+        if (messages.isEmpty()) {
+            throw illegalArgument("Message list cannot be empty");
+        }
+        
+        // Basic validation: ensure no consecutive user messages
+        for (int i = 0; i < messages.size() - 1; i++) {
+            ChatMessage current = messages.get(i);
+            ChatMessage next = messages.get(i + 1);
+            
+            if (current.type() == ChatMessageType.USER && next.type() == ChatMessageType.USER) {
+                throw illegalArgument(
+                        "Invalid message order: consecutive user messages found at positions %d and %d", i, i + 1);
+            }
+        }
+    }
+
+    /**
+     * Container class for messages parameter data.
+     */
+    private static class MessagesParameter {
+        private final List<ChatMessage> messages;
+        private final Messages annotation;
+
+        MessagesParameter(List<ChatMessage> messages, Messages annotation) {
+            this.messages = messages;
+            this.annotation = annotation;
+        }
+
+        List<ChatMessage> messages() {
+            return messages;
+        }
+
+        Messages annotation() {
+            return annotation;
+        }
     }
 }

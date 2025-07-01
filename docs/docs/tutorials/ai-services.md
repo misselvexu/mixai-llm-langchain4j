@@ -174,6 +174,131 @@ This annotation is necessary only when the `-parameters` option is *not* enabled
 `@UserMessage` can also load a prompt template from resources:
 `@UserMessage(fromResource = "my-prompt-template.txt")`
 
+## @Messages
+
+The `@Messages` annotation allows you to pass dynamic lists of chat messages directly to AI services,
+bypassing the template-based message construction. This is particularly useful for scenarios where you need
+to handle dynamic conversation history or programmatically constructed message sequences.
+
+### Basic Usage
+
+```java
+interface ChatService {
+    
+    String chat(@Messages List<ChatMessage> messages);
+    
+    String chat(@Messages ChatMessage... messages);
+}
+```
+
+### Use Cases
+
+The `@Messages` annotation is ideal for:
+
+- **Proxy services** that receive dynamic conversation history from external sources
+- **Multi-turn conversations** with complex message sequences
+- **RAG applications** with dynamic context injection
+- **Scenarios** where messages are programmatically constructed
+
+### Configuration Options
+
+The `@Messages` annotation provides several configuration options:
+
+```java
+interface AdvancedChatService {
+    
+    @Messages(
+        addToMemory = true,           // Add messages to chat memory after processing
+        validateOrder = true,         // Validate message order and structure
+        includeSystemMessage = true   // Include system messages from @SystemMessage annotation
+    )
+    String chat(List<ChatMessage> messages);
+}
+```
+
+### Combining with Other Annotations
+
+You can combine `@Messages` with other annotations:
+
+```java
+interface MixedChatService {
+    
+    @SystemMessage("You are a helpful assistant")
+    String chat(@Messages List<ChatMessage> history, @UserMessage String currentMessage);
+}
+```
+
+### Examples
+
+#### Simple Dynamic Messages
+```java
+interface Assistant {
+    String chat(@Messages List<ChatMessage> messages);
+}
+
+Assistant assistant = AiServices.create(Assistant.class, model);
+
+List<ChatMessage> messages = List.of(
+    SystemMessage.from("You are a helpful assistant"),
+    UserMessage.from("Hello"),
+    AiMessage.from("Hi there!"),
+    UserMessage.from("How are you?")
+);
+
+String response = assistant.chat(messages);
+```
+
+#### Array-based Messages
+```java
+interface Assistant {
+    String chat(@Messages ChatMessage... messages);
+}
+
+Assistant assistant = AiServices.create(Assistant.class, model);
+
+ChatMessage[] messages = {
+    SystemMessage.from("You are a helpful assistant"),
+    UserMessage.from("Hello"),
+    AiMessage.from("Hi there!"),
+    UserMessage.from("How are you?")
+};
+
+String response = assistant.chat(messages);
+```
+
+#### With Memory Integration
+```java
+interface Assistant {
+    @Messages(addToMemory = true)
+    String chat(List<ChatMessage> messages);
+}
+```
+
+#### With System Message Integration
+```java
+interface Assistant {
+    @SystemMessage("You are a helpful assistant")
+    @Messages(includeSystemMessage = true)
+    String chat(List<ChatMessage> messages);
+}
+```
+
+#### Disabling Order Validation
+```java
+interface Assistant {
+    @Messages(validateOrder = false)
+    String chat(List<ChatMessage> messages);
+}
+```
+
+### Important Notes
+
+- **Template variables** from `@UserMessage` and `@SystemMessage` are ignored for `@Messages` parameters
+- **Messages are sent directly** to the underlying ChatModel
+- **ChatMemory integration** can be controlled via `addToMemory()`
+- **Message order validation** can be enabled/disabled via `validateOrder()`
+- **System message inclusion** can be controlled via `includeSystemMessage()`
+
 ## Examples of valid AI Service methods
 
 Below are some examples of valid AI service methods.
@@ -243,6 +368,29 @@ String chat(@V("country") String country);
 @SystemMessage("Given a name of a country, {{answerInstructions}}")
 @UserMessage("{{country}}")
 String chat(@V("answerInstructions") String answerInstructions, @V("country") String country);
+```
+</details>
+
+<details>
+<summary>`Messages`</summary>
+
+```java
+String chat(@Messages List<ChatMessage> messages);
+
+String chat(@Messages ChatMessage... messages);
+
+@Messages(addToMemory = true)
+String chat(List<ChatMessage> messages);
+
+@Messages(validateOrder = false)
+String chat(List<ChatMessage> messages);
+
+@SystemMessage("You are a helpful assistant")
+@Messages(includeSystemMessage = true)
+String chat(List<ChatMessage> messages);
+
+@SystemMessage("You are a helpful assistant")
+String chat(@Messages List<ChatMessage> history, @UserMessage String currentMessage);
 ```
 </details>
 
